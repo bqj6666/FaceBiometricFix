@@ -1,69 +1,72 @@
-# FaceBiometricFix
+# FaceBiometricFix（类原生适配 fork）
 
-一个面向 ColorOS（OPPO/一加/真我）的 [Xposed](https://github.com/rovo89/XposedBridge) / LSPosed 模块，用于修正系统人脸传感器上报的非标准强度值（`4095`），使其被识别为标准 Class 3（强认证）强度，从而让面容解锁能够正常用于应用的 `BiometricPrompt`。
+本仓库 fork 自 [WAYYYAW/FaceBiometricFix](https://github.com/WAYYYAW/FaceBiometricFix)，遵循上游 GPL-3.0。
 
-## 背景
+上游面向 OPPO 系（ColorOS / AVIUM 等，OPPO / 一加 / 真我）机型。本 fork 在保留上游行为的前提下，做了三件事：**让它在类原生 / AOSP 系 ROM 上也能生效**、**加一个按应用开关**、**可选地让人脸参与强认证**。
 
-Android中生物识别分为三个安全级，Class1(4095,最弱),Class2(255,弱)，Class3(15,强)
+## 本 fork 的改动
 
-ColorOS 的人脸传感器向 `system_server` 上报 `4095`。因此当普通应用通过 `BiometricPrompt` 请求 Class 3 强认证（如网银、密码管理器）甚至CLass2弱认证时，系统判定人脸强度不足（`STATUS_INSUFFICIENT_STRENGTH`），面容解锁不会被纳入可选认证方式。
+### 1. 兼容类原生 ROM 上报的 255 强度（`MainHook.kt`）
 
-## 功能
+```kotlin
+// 上游：只认原厂上报的 4095
+sensorStrength == OEM_STRENGTH_MASK
 
-- 在 `system_server` 中hook `PreAuthInfo` 的资格预检流程，将普通应用请求的 `4095` 人脸强度修改为标准 Class 3 强度（15）。
-- 仅影响普通 App 的预检调用链，`SystemUI`、系统锁屏等路径仍保持 ColorOS 原生实现不变。
-- 排除 `com.coloros.codebook` 等系统应用，(尽量)避免影响系统自带的认证判定。
-
-## 工作原理
-
-
-
-1. **`com.android.server.biometrics.PreAuthInfo#getStatusForBiometricAuthenticator`**
-   `system_server` 内部执行强度判定时无法可靠取得原始调用者的 UID，因此利用 `PreAuthInfo` 的参数把调用上下文（`opPackageName`）记录到 `ThreadLocal` 中，供后续判定使用。
-
-2. **`com.android.server.biometrics.Utils#isAtLeastStrength`**
-   当检测到处于普通 App 的预检查调用链、传感器强度为 `4095`、且请求的是强认证（`15`）或弱认证（`255`）时，直接返回 `true`；其余所有路径沿用 ColorOS 原生实现。
-
-## 兼容性
-
-- 系统：ColorOS（OPPO / 一加 / 真我），LSPosed。
-- 框架要求：需支持现代 `libxposed API 102`（`io.github.libxposed:api:102.0.0`）的 LSPosed 框架。
-- 构建环境：AGP 9.3.2、Gradle 9.5.0、compileSdk 36、minSdk 35、targetSdk 36。
-- 仅在 oneplus ace3v + coloros 16 测试通过
-
-## 构建
-
-```bash
-./gradlew :app:assembleRelease
+// 本 fork：4095 与 255 同等放行
+(sensorStrength == OEM_STRENGTH_MASK || sensorStrength == WEAK_FACE_STRENGTH)
 ```
 
-或直接使用 Android Studio 打开项目。
+类原生 ROM 会把厂商人脸 HAL 上报的 `4095` 归一化成标准 Class 2 的 `255`。上游能正常挂上 hook，但强度值对不上 `4095`，判定分支永远不命中，表现为「模块装好了却完全没有效果」，且日志里没有任何异常，很难排查。
 
-生成的 APK 位于 `app/build/outputs/apk/release/`。
+### 2. 按应用开关（`SettingsActivity` / `PrefsProvider` / `Config`）
 
-## 安装与使用
+点开应用图标即为开关列表，**默认全部启用**，只持久化「被关掉」的包名。关掉的应用完全走系统原生判定，人脸不会被放行。
 
-1. 安装编译出的 APK（可能需关闭系统签名校验或使用支持的方式安装模块 APK）。
-2. 在 LSPosed 中启用本模块（固定作用域已声明为系统框架 `system`）。
-3. 首次启用请重启系统；后续覆盖更新模块支持 `system_server` 热重载（`autoHotReload=true`），无需再次重启。
-4. 在任意使用 `BiometricPrompt` 的应用中即可看到面容解锁选项。
+配置读取没有用 libxposed 的 `getRemotePreferences`：本机实测它恒返回空集合且不抛异常，界面等于摆设。改为模块进程用 `ContentProvider` 提供数据、system_server 侧用 system context 的 `ContentResolver` 读取，数据经 Binder 传递、不经过文件系统。改动后约 3 秒内生效，无需重启。
 
-## 说明与免责声明
+### 3. 可选：允许人脸满足强认证（默认关闭）
 
-- 本模块通过 Hook 系统进程实现，存在风险，请掌握基本救砖操作；
-- **Vibe Coding**而成，能用就行；
-- 不同 ColorOS 版本的系统内部实现可能有所差异，如失效可查看 Xposed 日志（Tag：`FaceBiometricFix`）定位原因。
-- 本项目仅供学习研究使用，请自行评估风险。
+认证成功后，系统用 `BiometricService.isStrongBiometric()` 决定是否保留人脸 HAL 生成的 `HardwareAuthToken`；判 false 时令牌被丢弃，日志为 `Dropping authToken for non-strong biometric`，Keystore 里生物识别绑定的密钥因此无法解锁。
 
-## 许可证
+该开关只接管这个判定，且必须**同时**满足两个条件，顺序不可颠倒：
 
-本项目基于 [GNU General Public License v3.0](LICENSE) 开源发布。
+```
+BiometricService.isStrongBiometric(sensorId)
+  ① sensorId 是人脸？
+  ② 读 BiometricService.mAuthSession 的 mOpPackageName → Config.isEnabled()？
+       被排除的应用 → 直接走原生（保证「不勾选就没有人脸」始终成立）
+  ③ AuthSession.mOperationId != 0（即调用方携带了 CryptoObject）？
+  → 三条全过才放行
+```
 
-## CI 自动构建与发布
+第 ② 步不可省略：这条路径上拿不到调用栈的包名，只能从当前 `AuthSession` 反查；漏掉它会让按应用开关在这条路径上失效，未勾选的应用照样拿到人脸。
 
-项目通过 [GitHub Actions](.github/workflows/build-release.yml) 在推送时自动构建：
+第 ③ 步这样限制的原因：只有携带 `CryptoObject` 的请求，其操作级令牌才由系统在 KeyMint 会话内签发，放行后确实能拿到；而「只拿认证成功结果、自己直连 Keystore 索取 per-op 令牌」的应用（银行类多为此）不吃时间级令牌，放行只会让它们以为可用、实际解锁失败。读不到会话或包名时一律返回 false，**宁可不生效也不误放行**。
 
-- **推送到 `main` 分支**：自动构建 Release APK（以 debug 密钥签名），并作为构建产物（Artifact）上传，可在 Actions 页面下载。
-- **推送 `v*` 标签**（如 `v1.0.0`）：自动构建、签名，并创建 GitHub Release 附上 APK。
+**风险提示**：开启该开关后，人脸在系统中被当作 Class 3 强认证，任何应用都能用人脸解锁其生物识别绑定的密钥，安全性实质下降。默认关闭，请自行评估。
 
-使用方法：在仓库页面点击 *Create a new release*，输入类似 `v1.0.0` 的标签，即可触发自动构建并生成 Release。
+其余文件差异只涉及构建链与本机环境适配（见下），不含额外功能。
+
+## 实测环境与证据
+
+测试机：OnePlus 13T（PKX110）/ AVIUM UI 16.2.1（`pagani-user`，SDK 36）/ LSPosed 2.2.0-it（API 102）。
+
+| 观测点 | 实测值 |
+| --- | --- |
+| 传感器注册 | `BiometricService: Registering ID: 1008 Modality: 8 Strength: 255` |
+| 传感器属性 | `dumpsys biometric` → `ID(1008), oemStrength: 255, modality 8` |
+| 模块挂载 | `hooking biometrics in system_server` / `OK: PreAuthInfo app context hook` / `OK: app-only 4095 strength check` / `OK: strong biometric hook` |
+| Class 3 预检 | `canAuthenticate: Authenticators=15` → `PreAuthInfo: Sensor ID: 1008 Status: 1`（已放行） |
+| 实际认证 | `handleAuthenticate: StrengthRequested: 15` → `FaceAuthenticationClient` → `handleAuthenticationSucceeded(), sensorId: 1008` |
+| 开关关闭对照 | `skip by config: com.github.android` → 人脸 `Status: 4`、指纹 `Status: 1` |
+| 开关开启对照 | `treat face as strong: sensorId=1008` → `AuthSession: addAuthToken: 0` |
+
+其中 `Status: 1` 即 `STATUS_OK`：原生实现下人脸 `255` 对请求 `15` 必然返回 `4`（`STATUS_INSUFFICIENT_STRENGTH`），所以返回 `1` 就证明强度闸门确实被放行。`addAuthToken: 0` 表示令牌注入成功。
+
+## 已知限制
+
+- 人脸仍不被判定为 strong（未开第三个开关时）：日志中持续出现 `Dropping authToken for non-strong biometric, id: 1008`，将密钥绑定至生物识别的应用（`setUserAuthenticationRequired`）仍只能使用指纹。
+- 银行类应用多不携带 `CryptoObject`：它们拿到认证结果后自行直连 Keystore 索取操作级令牌（实测招商银行 `CmbSecurityTEEKey`，`USER_AUTH_TYPE=4` 但无 `USER_AUTH_TIMEOUT`，即 per-operation），这类密钥只接受 KeyMint 当次会话签发的令牌，本模块不介入，也不会 hook 这类应用。
+- 人脸资格还受摄像头状态影响：`modality 8` 且摄像头被占用时 `PreAuthInfo` 返回 `6`（`STATUS_HARDWARE_UNAVAILABLE`），这不是模块问题。
+- 目标 ROM 上报的强度若不是 `4095` / `255`，用 `logcat | grep "Registering ID"` 看 `Strength:` 实际值，再同步常量即可。
+- 第三个开关的传感器判定使用硬编码 id（本机人脸为 `1008`）。换机型需同步 `MainHook.FACE_SENSOR_ID`。
