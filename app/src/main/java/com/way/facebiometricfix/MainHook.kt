@@ -83,8 +83,9 @@ class MainHook : XposedModule() {
 
         // 先看按应用开关：被关掉的应用完全走原生，不做任何接管。
         // 放在 CryptoObject 判定之前，保证"不勾选即无人脸"这条约束始终成立。
+        // 取不到包名时也一律不放行：配置未知一律按最保守处理（fail-safe）。
         val packageName = runCatching { current.second }.getOrNull()
-        if (packageName != null && !Config.isEnabled(packageName)) {
+        if (packageName == null || !Config.isEnabled(packageName)) {
             logInfo("skip by config: $packageName")
             return@Hooker false
         }

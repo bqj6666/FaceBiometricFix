@@ -13,6 +13,26 @@ import android.util.Log
  *
  * 数据由模块进程经 [PrefsProvider] 提供，system_server 侧用 system context 的
  * ContentResolver 读取，经 Binder 传递、不经过文件系统。
+ *
+ * ===== 2026-10-20 修复：配置读取的 fail-open 缺陷 =====
+ *
+ * 原实现把「读取结果」无条件写回缓存：
+ *
+ *     disable = packages    // packages 默认是空集合
+ *
+ * 而开机早期模块 App 的进程还没起来时，system_server 查 provider 会失败
+ * （实测日志：`Failed to find provider info ...` 紧接着
+ *  `Unable to launch app ... for provider ...: process is bad`），此时
+ * query 拿不到有效行，于是 **空集合被当成「没有任何应用被禁用」写进缓存**，
+ * 结果所有应用（包括用户明确取消勾选的银行类 App）都能继续用面容。
+ *
+ * 修复要点：
+ * 1) [PrefsProvider.query] 永远至少返回 allow_face_strong 一行，因此
+ *    「读到 0 行」等价于 provider 不可用，必须判为失败，不得覆盖缓存；
+ * 2) 失败时把 lastLoad 归零，下一次判定立刻重试（而不是等满 TTL）；
+ * 3) 引入 [loaded] 标记：在成功读到有效配置之前，[isEnabled] 一律返回 false，
+ *    即**不做任何接管、完全走系统原生行为**（fail-safe），
+ *    避免「配置未知」被误解成「全部允许」。
  */
 internal object Config {
 
@@ -34,6 +54,10 @@ internal object Config {
     @Volatile
     private var allowFaceStrong = false
 
+    /** 是否至少成功读到过一次有效配置。false 时一律不接管。 */
+    @Volatile
+    private var loaded = false
+
     @Volatile
     private var lastLoad = 0L
 
@@ -45,11 +69,14 @@ internal object Config {
 
     fun isEnabled(packageName: String): Boolean {
         refresh()
+        // 配置尚未可靠加载：不接管，交给系统原生逻辑，避免失败开放。
+        if (!loaded) return false
         return packageName !in disabled
     }
 
     fun isFaceStrongAllowed(): Boolean {
         refresh()
+        if (!loaded) return false
         return allowFaceStrong
     }
 
@@ -66,12 +93,14 @@ internal object Config {
         val context = systemContext()
         if (context == null) {
             Log.w(TAG, "system context unavailable, keep config as-is")
+            lastLoad = 0L
             return
         }
 
         val result = runCatching {
             val packages = HashSet<String>()
             var allow = false
+            var rows = 0
             context.contentResolver
                 .query(Uri.parse("content://$AUTHORITY"), null, null, null, null)
                 ?.use { cursor ->
@@ -79,6 +108,7 @@ internal object Config {
                     val valueIndex = cursor.getColumnIndex(COLUMN_VALUE)
                     if (keyIndex >= 0 && valueIndex >= 0) {
                         while (cursor.moveToNext()) {
+                            rows++
                             when (cursor.getString(keyIndex)) {
                                 KEY_DISABLED -> cursor.getString(valueIndex)?.let { packages.add(it) }
                                 KEY_ALLOW_FACE_STRONG -> allow = cursor.getString(valueIndex) == "1"
@@ -86,15 +116,26 @@ internal object Config {
                         }
                     }
                 }
-            packages to allow
+            Triple(packages, allow, rows)
         }
 
-        result.onSuccess { (packages, allow) ->
+        result.onSuccess { (packages, allow, rows) ->
+            // provider 必定至少返回 allow_face_strong 一行；0 行说明没真正读到，
+            // 此时绝不能把空集合写进缓存（否则等于「谁都没被禁用」）。
+            if (rows <= 0) {
+                Log.w(TAG, "config query returned no rows (provider unavailable?), keep previous: disabled=$disabled")
+                lastLoad = 0L
+                return@onSuccess
+            }
             disabled = packages
             allowFaceStrong = allow
+            loaded = true
             Log.i(TAG, "config loaded, allowFaceStrong=$allow, disabled=$packages")
         }
-        result.onFailure { Log.w(TAG, "read config failed: $it") }
+        result.onFailure {
+            Log.w(TAG, "read config failed: $it, keep previous: disabled=$disabled")
+            lastLoad = 0L
+        }
     }
 
     /** system_server 中取得 system context，用于访问 ContentProvider。 */
