@@ -4,6 +4,9 @@ import android.app.Activity
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Bundle
+import android.provider.Settings
+import android.util.Log
+import android.widget.Toast
 import android.view.Menu
 import android.view.MenuItem
 import android.view.ViewGroup
@@ -62,6 +65,7 @@ class SettingsActivity : Activity() {
             setOnCheckedChangeListener { _, checked ->
                 prefs.edit().putBoolean(Config.KEY_ALLOW_FACE_STRONG, checked).apply()
                 updateStrongHint()
+                pushToSecureSettings()
             }
         }
 
@@ -135,6 +139,14 @@ class SettingsActivity : Activity() {
             else uncheckedPackages.add(pkg)
             save()
         }
+
+        // 重装后 Settings.Secure 可能为空（权限被重置或从未写过），这里自愈一次，
+        // 避免必须手动点一下开关才有配置。
+        runCatching {
+            if (Settings.Secure.getString(contentResolver, Config.SETTING_DISABLED) == null) {
+                pushToSecureSettings()
+            }
+        }
     }
 
     private fun updateStrongHint() {
@@ -147,6 +159,41 @@ class SettingsActivity : Activity() {
         prefs.edit()
             .putStringSet(Config.KEY_DISABLED, HashSet(uncheckedPackages))
             .apply()
+        pushToSecureSettings()
+    }
+
+    /**
+     * 把配置同步写入 Settings.Secure。
+     *
+     * system_server 读 Settings 零成本、不依赖本 App 进程是否存活，所以这条通道才是
+     * 模块真正生效的关键。写入需要 WRITE_SECURE_SETTINGS，安装后执行一次：
+     *     pm grant com.way.facebiometricfix android.permission.WRITE_SECURE_SETTINGS
+     * 未授权时静默失败（本地 SharedPreferences 仍已保存，但 system_server 读不到）。
+     */
+    private fun pushToSecureSettings() {
+        val ok = runCatching {
+            Settings.Secure.putString(
+                contentResolver,
+                Config.SETTING_DISABLED,
+                uncheckedPackages.joinToString(",")
+            )
+            Settings.Secure.putString(
+                contentResolver,
+                Config.SETTING_ALLOW_STRONG,
+                if (prefs.getBoolean(Config.KEY_ALLOW_FACE_STRONG, false)) "1" else "0"
+            )
+            true
+        }.getOrElse {
+            Log.w(TAG, "write Settings.Secure failed (missing WRITE_SECURE_SETTINGS?): $it")
+            false
+        }
+        if (!ok) {
+            Toast.makeText(
+                this,
+                "写入系统设置失败：请在终端执行 pm grant 授权",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -174,6 +221,7 @@ class SettingsActivity : Activity() {
     }
 
     private companion object {
+        const val TAG = "FaceBiometricFix"
         const val MENU_ENABLE_ALL = 1
         const val MENU_DISABLE_ALL = 2
     }

@@ -3,7 +3,12 @@ package com.way.facebiometricfix
 import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
+import android.util.Xml
+import io.github.libxposed.api.XposedModule
+import org.xmlpull.v1.XmlPullParser
+import java.io.FileInputStream
 
 /**
  * 跨进程配置。
@@ -11,28 +16,24 @@ import android.util.Log
  * - [KEY_DISABLED]：被关闭面容的应用包名，其余应用一律放行（默认全开）
  * - [KEY_ALLOW_FACE_STRONG]：是否允许人脸满足强认证（默认关）
  *
- * 数据由模块进程经 [PrefsProvider] 提供，system_server 侧用 system context 的
- * ContentResolver 读取，经 Binder 传递、不经过文件系统。
+ * ===== 为什么不再依赖模块 App 常驻 =====
  *
- * ===== 2026-10-20 修复：配置读取的 fail-open 缺陷 =====
+ * 旧实现只靠 ContentResolver 查询 [PrefsProvider]，要求模块进程被拉起并存活。
+ * 实测（uwuaosp）该进程空闲即被回收，AMS 重新拉起又失败：
  *
- * 原实现把「读取结果」无条件写回缓存：
+ *     Unable to launch app com.way.facebiometricfix/10611 for provider ...: process is bad
  *
- *     disable = packages    // packages 默认是空集合
+ * 于是 system_server 永远读不到配置，模块整体失效 —— 连勾选放行的应用也失去人脸。
  *
- * 而开机早期模块 App 的进程还没起来时，system_server 查 provider 会失败
- * （实测日志：`Failed to find provider info ...` 紧接着
- *  `Unable to launch app ... for provider ...: process is bad`），此时
- * query 拿不到有效行，于是 **空集合被当成「没有任何应用被禁用」写进缓存**，
- * 结果所有应用（包括用户明确取消勾选的银行类 App）都能继续用面容。
+ * ===== 四级读取（优先级从高到低）=====
  *
- * 修复要点：
- * 1) [PrefsProvider.query] 永远至少返回 allow_face_strong 一行，因此
- *    「读到 0 行」等价于 provider 不可用，必须判为失败，不得覆盖缓存；
- * 2) 失败时把 lastLoad 归零，下一次判定立刻重试（而不是等满 TTL）；
- * 3) 引入 [loaded] 标记：在成功读到有效配置之前，[isEnabled] 一律返回 false，
- *    即**不做任何接管、完全走系统原生行为**（fail-safe），
- *    避免「配置未知」被误解成「全部允许」。
+ *   1) [Settings.Secure]：系统原生存储。system_server 读它零成本、**不依赖任何进程**，
+ *      也不受 /data 路径隐藏影响。写入方是本 App（需 WRITE_SECURE_SETTINGS，安装后
+ *      `pm grant` 一次即可）。
+ *   2) libxposed [XposedModule.openRemoteFile]：daemon 代开模块的 prefs 文件。
+ *      （不用 getRemotePreferences —— 实测本机恒返回空集合且不抛异常）
+ *   3) ContentProvider：模块进程恰好存活时的快速通道。
+ *   4) 都失败则保留上次成功值；从未成功过时不接管（fail-safe）。
  */
 internal object Config {
 
@@ -41,11 +42,16 @@ internal object Config {
     const val KEY_ALLOW_FACE_STRONG = "allow_face_strong"
     const val AUTHORITY = "com.way.facebiometricfix.prefs"
 
+    /** Settings.Secure 中使用的键（与 SharedPreferences 的键分开，避免混淆） */
+    const val SETTING_DISABLED = "facebiometricfix_disabled_packages"
+    const val SETTING_ALLOW_STRONG = "facebiometricfix_allow_face_strong"
+
+    private const val PREFS_RELATIVE_PATH = "shared_prefs/config.xml"
     private const val COLUMN_KEY = "key"
     private const val COLUMN_VALUE = "value"
     private const val TAG = "FaceBiometricFix"
 
-    /** 配置缓存有效期：避免每次判定都跨进程查询 */
+    /** 配置缓存有效期：避免每次判定都重新读取 */
     private const val TTL_MS = 3000L
 
     @Volatile
@@ -61,15 +67,17 @@ internal object Config {
     @Volatile
     private var lastLoad = 0L
 
-    /** 在 system_server 启动与热重载时预读一次。日志走 logcat，不依赖模块实例。 */
-    fun attach() {
+    @Volatile
+    private var module: XposedModule? = null
+
+    fun attach(m: XposedModule?) {
+        module = m
         lastLoad = 0L
         load()
     }
 
     fun isEnabled(packageName: String): Boolean {
         refresh()
-        // 配置尚未可靠加载：不接管，交给系统原生逻辑，避免失败开放。
         if (!loaded) return false
         return packageName !in disabled
     }
@@ -87,15 +95,117 @@ internal object Config {
     }
 
     private fun load() {
-        // 先记时间戳，避免读取过程中被重复触发
         lastLoad = SystemClock.uptimeMillis()
 
-        val context = systemContext()
-        if (context == null) {
-            Log.w(TAG, "system context unavailable, keep config as-is")
-            lastLoad = 0L
-            return
+        if (loadFromSettings()) return
+        if (loadFromRemoteFile()) return
+        if (loadFromProvider()) return
+
+        Log.w(TAG, "config unavailable on all channels, keep previous: disabled=$disabled")
+        lastLoad = 0L
+    }
+
+    /**
+     * 通道 1：Settings.Secure。
+     *
+     * 由模块 App 写入（安装后 `pm grant ... WRITE_SECURE_SETTINGS`）。
+     * system_server 读取无权限要求，且与 App 进程是否存活完全无关。
+     */
+    private fun loadFromSettings(): Boolean {
+        val context = systemContext() ?: return false
+        return runCatching {
+            val cr = context.contentResolver
+            // Settings 只支持字符串，包名用逗号分隔（包名不含逗号）
+            val raw = Settings.Secure.getString(cr, SETTING_DISABLED)
+            val allowRaw = Settings.Secure.getString(cr, SETTING_ALLOW_STRONG)
+            if (raw == null && allowRaw == null) {
+                return false    // 从未写入，交给下一条通道
+            }
+            val packages: Set<String> = raw
+                ?.split(',')
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.toHashSet()
+                ?: emptySet()
+            disabled = packages
+            allowFaceStrong = allowRaw == "1"
+            loaded = true
+            Log.i(TAG, "config loaded via Settings.Secure, allowFaceStrong=$allowFaceStrong, disabled=$disabled")
+            true
+        }.getOrElse {
+            Log.w(TAG, "Settings.Secure failed: $it")
+            false
         }
+    }
+
+    /** 通道 2：daemon 代开文件 + 自行解析 SharedPreferences XML。 */
+    private fun loadFromRemoteFile(): Boolean {
+        val m = module ?: return false
+        return runCatching {
+            val pfd = m.openRemoteFile(PREFS_RELATIVE_PATH)
+            if (pfd == null) {
+                Log.w(TAG, "remote file unavailable")
+                return false
+            }
+            pfd.use { fd ->
+                val packages = HashSet<String>()
+                var allow = false
+                var found = false
+
+                val parser = Xml.newPullParser()
+                parser.setInput(FileInputStream(fd.fileDescriptor), null)
+
+                var event = parser.eventType
+                var inDisabledSet = false
+                while (event != XmlPullParser.END_DOCUMENT) {
+                    when (event) {
+                        XmlPullParser.START_TAG -> when (parser.name) {
+                            "set" -> inDisabledSet =
+                                KEY_DISABLED == parser.getAttributeValue(null, "name")
+                            "boolean" -> {
+                                if (KEY_ALLOW_FACE_STRONG == parser.getAttributeValue(null, "name")) {
+                                    allow = "true" == parser.getAttributeValue(null, "value")
+                                    found = true
+                                }
+                            }
+                            else -> Unit
+                        }
+                        XmlPullParser.TEXT -> {
+                            if (inDisabledSet) {
+                                val pkg = parser.text?.trim()
+                                if (!pkg.isNullOrEmpty()) {
+                                    packages.add(pkg)
+                                    found = true
+                                }
+                            }
+                        }
+                        XmlPullParser.END_TAG -> {
+                            if ("set" == parser.name) inDisabledSet = false
+                        }
+                        else -> Unit
+                    }
+                    event = parser.next()
+                }
+
+                if (!found) {
+                    Log.w(TAG, "remote file parsed but empty")
+                    return false
+                }
+                disabled = packages
+                allowFaceStrong = allow
+                loaded = true
+                Log.i(TAG, "config loaded via remote file, allowFaceStrong=$allow, disabled=$packages")
+                true
+            }
+        }.getOrElse {
+            Log.w(TAG, "remote file failed: $it")
+            false
+        }
+    }
+
+    /** 通道 3：ContentProvider（模块进程存活时）。 */
+    private fun loadFromProvider(): Boolean {
+        val context = systemContext() ?: return false
 
         val result = runCatching {
             val packages = HashSet<String>()
@@ -120,25 +230,21 @@ internal object Config {
         }
 
         result.onSuccess { (packages, allow, rows) ->
-            // provider 必定至少返回 allow_face_strong 一行；0 行说明没真正读到，
-            // 此时绝不能把空集合写进缓存（否则等于「谁都没被禁用」）。
             if (rows <= 0) {
-                Log.w(TAG, "config query returned no rows (provider unavailable?), keep previous: disabled=$disabled")
-                lastLoad = 0L
+                Log.w(TAG, "provider query returned no rows")
                 return@onSuccess
             }
             disabled = packages
             allowFaceStrong = allow
             loaded = true
-            Log.i(TAG, "config loaded, allowFaceStrong=$allow, disabled=$packages")
+            Log.i(TAG, "config loaded via provider, allowFaceStrong=$allow, disabled=$packages")
         }
-        result.onFailure {
-            Log.w(TAG, "read config failed: $it, keep previous: disabled=$disabled")
-            lastLoad = 0L
-        }
+        result.onFailure { Log.w(TAG, "provider query failed: $it") }
+
+        return result.isSuccess && loaded
     }
 
-    /** system_server 中取得 system context，用于访问 ContentProvider。 */
+    /** system_server 中取得 system context。 */
     private fun systemContext(): Context? = runCatching {
         val activityThread = Class.forName("android.app.ActivityThread")
         val current = activityThread
