@@ -132,13 +132,13 @@ class MainHook : XposedModule() {
 
     override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
         logInfo("hooking biometrics in system_server ...")
-        Config.attach()
+        Config.attach(this)
         installHooks(param.classLoader)
     }
 
     override fun onHotReloading(param: XposedModuleInterface.HotReloadingParam): Boolean {
         APP_PRE_AUTH_PACKAGE.remove()
-        Config.attach()
+        Config.attach(this)
         logInfo("Hot reloading biometrics hooks in system_server ...")
         return true
     }
